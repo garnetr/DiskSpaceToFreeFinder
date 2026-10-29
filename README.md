@@ -18,13 +18,15 @@ Photos, Logos, and the rest of an app's real library are listed separately and a
 python3 disk_space_report.py
 ```
 
-That writes `./disk-space-to-free.md` and `./delete-disk-space.zsh` when the terminal shell is zsh, or `./delete-disk-space.bash` when it is bash.
+That writes `./disk-space-to-free.md` and a delete script for the shell this terminal is running. It walks from the scanner up to Terminal, iTerm, or another terminal app and uses the shell attached to that app. A zsh terminal gets `delete-disk-space.zsh`. A bash terminal gets `delete-disk-space.bash`. `--shell zsh` or `--shell bash` overrides the detection.
 
 The delete script prints one section at a time: the size, the paths, and what deleting that section keeps. Answer `y` or `yes` to delete that section. Press Enter to skip it. Photos, Logos, and the other libraries in the report are not in the script.
 
 ```bash
-zsh delete-disk-space.zsh
+./delete-disk-space.zsh
 ```
+
+Run whichever filename the scanner wrote. The shebang matches that terminal.
 
 ```bash
 python3 disk_space_report.py -o ~/Desktop/disk-space-to-free.md --delete-script ~/Desktop/delete-disk-space.zsh --shell zsh
