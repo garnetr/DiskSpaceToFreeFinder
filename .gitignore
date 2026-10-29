@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 disk-space-to-free.md
 *.report.md
+delete-disk-space.zsh
+delete-disk-space.bash
+delete-disk-space.sh

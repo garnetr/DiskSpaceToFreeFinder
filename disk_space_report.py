@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Scan this Mac for disk space that can be freed and write a Markdown report.
 
-The script only reads sizes and writes a report. It does not delete files.
+The scanner itself does not delete files. It also writes a zsh or bash script
+that shows each reclaimable section and deletes that section only after a yes.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -73,6 +76,46 @@ class ModelCopy:
     size: int
     exact_key: str
     base_key: str
+
+
+@dataclass
+class DeleteAction:
+    path: Path
+    size: int
+    kind: str
+
+
+@dataclass
+class DeleteSection:
+    title: str
+    summary: str
+    lines: list[str]
+    actions: list[DeleteAction]
+
+    @property
+    def size(self) -> int:
+        return sum(action.size for action in self.actions)
+
+
+# Exact paths the delete script must never remove. Children of these paths can still be removed.
+DENIED_RELATIVE = (
+    Path("Library"),
+    Path("Library/Application Support"),
+    Path("Library/Application Support/Evernote"),
+    Path("Library/Application Support/Logos4"),
+    Path("Library/Application Support/Bitwig"),
+    Path("Documents"),
+    Path("Documents/Bitwig Studio"),
+    Path("Downloads"),
+    Path("projects"),
+    Path("projects/Obsidian Backups"),
+    Path("Pictures"),
+    Path("Pictures/Photos Library.photoslibrary"),
+    Path(".lmstudio"),
+    Path(".lmstudio/models"),
+    Path(".cache"),
+    Path(".hermes"),
+)
 
 
 @dataclass
@@ -553,7 +596,458 @@ def variant_extra_savings(groups: list[tuple[str, list[tuple[str, list[ModelCopy
     return extra
 
 
-def render(report: Scan, home: Path) -> str:
+def is_deletable(path: Path, home: Path, kind: str) -> bool:
+    if kind not in {"file", "dir"}:
+        return False
+    if ".." in path.parts:
+        return False
+    try:
+        resolved = path.resolve()
+        home_resolved = home.resolve()
+    except OSError:
+        return False
+    if resolved == home_resolved or resolved == Path("/"):
+        return False
+    try:
+        relative = resolved.relative_to(home_resolved)
+    except ValueError:
+        return False
+    if relative in DENIED_RELATIVE:
+        return False
+    if resolved.exists():
+        if kind == "file" and not resolved.is_file():
+            return False
+        if kind == "dir" and not resolved.is_dir():
+            return False
+    return True
+
+
+def accepted_actions(actions: list[DeleteAction], home: Path) -> list[DeleteAction]:
+    kept: list[DeleteAction] = []
+    for action in actions:
+        if is_deletable(action.path, home, action.kind):
+            kept.append(action)
+        else:
+            log(f"not offering to delete {action.path}")
+    return kept
+
+
+def section_if_any(
+    title: str,
+    summary: str,
+    lines: list[str],
+    actions: list[DeleteAction],
+    home: Path,
+) -> DeleteSection | None:
+    safe = accepted_actions(actions, home)
+    if not safe:
+        return None
+    return DeleteSection(title, summary, lines, safe)
+
+
+def build_delete_sections(report: Scan, home: Path) -> list[DeleteSection]:
+    sections: list[DeleteSection] = []
+
+    if report.safe_caches:
+        lines = []
+        actions = []
+        for item in report.safe_caches:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+            if item.note:
+                lines.append(f"            {item.note}")
+            actions.append(DeleteAction(item.path, item.size, "dir"))
+        if report.cache_breakdown:
+            lines.append("")
+            lines.append("Largest folders inside ~/Library/Caches, removed with that folder:")
+            for item in report.cache_breakdown:
+                lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+        found = section_if_any(
+            "Safe caches",
+            "Apps rebuild these folders.",
+            lines,
+            actions,
+            home,
+        )
+        if found:
+            sections.append(found)
+
+    if report.evernote:
+        lines = []
+        actions = []
+        for item in report.evernote:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+            if item.note:
+                lines.append(f"            {item.note}")
+            actions.append(DeleteAction(item.path, item.size, "dir"))
+        found = section_if_any(
+            "Evernote cache",
+            "Evernote downloads these attachments again when you open the note. The notebook database is not in this section.",
+            lines,
+            actions,
+            home,
+        )
+        if found:
+            sections.append(found)
+
+    if report.partials:
+        lines = []
+        actions = []
+        for item in report.partials:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+            if item.note:
+                lines.append(f"            {item.note}")
+            actions.append(DeleteAction(item.path, item.size, "file"))
+            map_path = Path(str(item.path) + ".map")
+            if map_path.is_file():
+                actions.append(DeleteAction(map_path, map_path.stat().st_size, "file"))
+                lines.append(f"{fmt_bytes(map_path.stat().st_size):>10}  {display_path(map_path, home)}")
+        found = section_if_any(
+            "Unfinished downloads",
+            "Incomplete files. Finished models are not in this section.",
+            lines,
+            actions,
+            home,
+        )
+        if found:
+            sections.append(found)
+
+    repeat_lines: list[str] = []
+    repeat_actions: list[DeleteAction] = []
+    for key, copies in repeated_groups(report.models):
+        ordered = sorted(copies, key=lambda copy: copy.size, reverse=True)
+        keep = ordered[0]
+        repeat_lines.append(f"{key}: keep {fmt_bytes(keep.size)}  {display_path(keep.path, home)}")
+        for copy in ordered[1:]:
+            repeat_lines.append(f"  delete {fmt_bytes(copy.size):>10}  {display_path(copy.path, home)}")
+            repeat_actions.append(DeleteAction(copy.path, copy.size, "dir"))
+        repeat_lines.append("")
+    found = section_if_any(
+        "Repeated model files",
+        "Deletes extra copies of the same model name. The largest copy of each name stays.",
+        repeat_lines,
+        repeat_actions,
+        home,
+    )
+    if found:
+        sections.append(found)
+
+    variant_lines: list[str] = []
+    variant_actions: list[DeleteAction] = []
+    for base, exacts in variant_groups(report.models):
+        copies = [copy for _, group in exacts for copy in group]
+        largest = max(copies, key=lambda copy: copy.size)
+        variant_lines.append(f"{base}: keep variant `{largest.exact_key}`")
+        for exact, group in exacts:
+            ordered = sorted(group, key=lambda copy: copy.size, reverse=True)
+            if exact == largest.exact_key:
+                for copy in ordered:
+                    variant_lines.append(f"  keep   {fmt_bytes(copy.size):>10}  {display_path(copy.path, home)}")
+                continue
+            for copy in ordered:
+                variant_lines.append(f"  delete {fmt_bytes(copy.size):>10}  {display_path(copy.path, home)}")
+                variant_actions.append(DeleteAction(copy.path, copy.size, "dir"))
+        variant_lines.append("")
+    found = section_if_any(
+        "Other variants of the same base model",
+        "Deletes other finetunes and builds. The variant that contains the largest file stays, including its extra copies.",
+        variant_lines,
+        variant_actions,
+        home,
+    )
+    if found:
+        sections.append(found)
+
+    bigly = home / "Documents" / "BiglyBT Downloads"
+    if report.biglybt_total and bigly.exists():
+        lines = [
+            f"{fmt_bytes(report.biglybt_total):>10}  {display_path(bigly, home)}",
+            "",
+            "Largest items inside that folder:",
+        ]
+        for item in report.biglybt:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+        lines.append("")
+        lines.append("Confirming deletes the whole folder, including items not listed above.")
+        found = section_if_any(
+            "BiglyBT downloads",
+            "Downloaded files in the BiglyBT folder.",
+            lines,
+            [DeleteAction(bigly, report.biglybt_total, "dir")],
+            home,
+        )
+        if found:
+            sections.append(found)
+
+    def file_section(title: str, summary: str, items: list[SizedPath]) -> None:
+        if not items:
+            return
+        lines = []
+        actions = []
+        for item in items:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+            if item.note:
+                lines.append(f"            {item.note}")
+            actions.append(DeleteAction(item.path, item.size, "file"))
+        found_section = section_if_any(title, summary, lines, actions, home)
+        if found_section:
+            sections.append(found_section)
+
+    file_section(
+        "Large recordings and backup media",
+        "Large audio and video files. Other project files stay.",
+        report.large_media,
+    )
+    file_section(
+        "Installer downloads",
+        "Disk images and installer packages. Safe once that app is already installed.",
+        report.installers,
+    )
+    file_section(
+        "Other large downloads",
+        "Other large files in Downloads. These are your files.",
+        report.other_downloads,
+    )
+
+    if report.other_caches:
+        lines = []
+        actions = []
+        for item in report.other_caches:
+            lines.append(f"{fmt_bytes(item.size):>10}  {display_path(item.path, home)}")
+            if item.note:
+                lines.append(f"            {item.note}")
+            actions.append(DeleteAction(item.path, item.size, "dir"))
+        found = section_if_any(
+            "Other caches to check",
+            "Tool caches that may hold downloaded data.",
+            lines,
+            actions,
+            home,
+        )
+        if found:
+            sections.append(found)
+
+    return sections
+
+
+def detect_shell(explicit: str | None) -> str:
+    if explicit in {"zsh", "bash"}:
+        return explicit
+    name = Path(os.environ.get("SHELL", "")).name
+    if name in {"zsh", "bash"}:
+        return name
+    return "zsh"
+
+
+def default_script_name(shell: str) -> str:
+    return f"delete-disk-space.{shell}"
+
+
+def render_delete_script(
+    sections: list[DeleteSection],
+    home: Path,
+    shell: str,
+    generated_at: str,
+) -> str:
+    home_text = str(home.resolve())
+    denied = [home_text, "/"]
+    denied.extend(str((home / relative).resolve()) for relative in DENIED_RELATIVE)
+    if shell == "zsh":
+        header = [
+            "#!/bin/zsh",
+            "# Generated by disk_space_report.py. Running it asks before each section.",
+            f"# Generated {generated_at} for {home_text}.",
+            "emulate -L zsh",
+            "setopt LOCAL_OPTIONS NO_UNSET",
+            "",
+        ]
+        confirm_fn = [
+            "confirm_section() {",
+            "  local answer",
+            "  print -n -r -- \"Delete this section? [y/N] \"",
+            "  if ! read -r answer; then",
+            "    print -r -- \"\"",
+            "    return 1",
+            "  fi",
+            '  [[ "${answer:l}" == "y" || "${answer:l}" == "yes" ]]',
+            "}",
+            "",
+        ]
+        say = "print -r --"
+    else:
+        header = [
+            "#!/bin/bash",
+            "# Generated by disk_space_report.py. Running it asks before each section.",
+            f"# Generated {generated_at} for {home_text}.",
+            "set -u",
+            "",
+        ]
+        confirm_fn = [
+            "confirm_section() {",
+            "  local answer lower",
+            "  printf '%s' \"Delete this section? [y/N] \"",
+            "  if ! read -r answer; then",
+            "    printf '\\n'",
+            "    return 1",
+            "  fi",
+            "  lower=$(printf '%s' \"$answer\" | tr '[:upper:]' '[:lower:]')",
+            '  [[ "$lower" == "y" || "$lower" == "yes" ]]',
+            "}",
+            "",
+        ]
+        say = "printf '%s\\n'"
+
+    lines = list(header)
+    lines.append(f"HOME_DIR={shlex.quote(home_text)}")
+    lines.append("DENY=(")
+    for path in denied:
+        lines.append(f"  {shlex.quote(path)}")
+    lines.append(")")
+    lines.append("")
+    lines.extend(
+        [
+            "refuse() {",
+            f"  {say} \"Refusing to delete: $1\"",
+            "  return 1",
+            "}",
+            "",
+            "safe_to_remove() {",
+            '  local target="$1"',
+            '  local kind="$2"',
+            '  local denied',
+            '  [[ "$target" == /* ]] || { refuse "$target"; return 1; }',
+            '  [[ "$target" != *..* ]] || { refuse "$target"; return 1; }',
+            '  [[ "$target" == "$HOME_DIR/"* ]] || { refuse "$target"; return 1; }',
+            '  for denied in "${DENY[@]}"; do',
+            '    if [[ "$target" == "$denied" ]]; then',
+            '      refuse "$target"',
+            "      return 1",
+            "    fi",
+            "  done",
+            '  if [[ "$kind" == "file" ]]; then',
+            '    if [[ -e "$target" && ! -f "$target" ]]; then',
+            '      refuse "$target"',
+            "      return 1",
+            "    fi",
+            '  elif [[ "$kind" == "dir" ]]; then',
+            '    if [[ -e "$target" && ! -d "$target" ]]; then',
+            '      refuse "$target"',
+            "      return 1",
+            "    fi",
+            "  else",
+            '    refuse "$target"',
+            "    return 1",
+            "  fi",
+            "  return 0",
+            "}",
+            "",
+            "remove_path() {",
+            '  local target="$1"',
+            '  local kind="$2"',
+            '  safe_to_remove "$target" "$kind" || return 1',
+            '  if [[ "$kind" == "dir" ]]; then',
+            '    rm -rf -- "$target" || return 1',
+            "  else",
+            '    rm -f -- "$target" || return 1',
+            "  fi",
+            f"  {say} \"  removed: $target\"",
+            "}",
+            "",
+            "remove_counted() {",
+            '  local target="$1"',
+            '  local kind="$2"',
+            '  local bytes="$3"',
+            '  if grep -F -x -q -- "$target" "$REMOVED_LIST"; then',
+            f"    {say} \"  already removed in an earlier section: $target\"",
+            "    return 0",
+            "  fi",
+            '  if [[ ! -e "$target" && ! -L "$target" ]]; then',
+            f"    {say} \"  already gone: $target\"",
+            "    printf '%s\\n' \"$target\" >> \"$REMOVED_LIST\"",
+            "    return 0",
+            "  fi",
+            '  remove_path "$target" "$kind" || return 1',
+            "  printf '%s\\n' \"$target\" >> \"$REMOVED_LIST\"",
+            "  deleted_bytes=$((deleted_bytes + bytes))",
+            "}",
+            "",
+            "format_bytes() {",
+            "  awk -v bytes=\"$1\" 'BEGIN {",
+            '    split("B KB MB GB TB", units, " ")',
+            "    value = bytes + 0",
+            "    unit = 1",
+            "    while (value >= 1024 && unit < 5) { value /= 1024; unit++ }",
+            '    if (unit == 1) printf "%d %s\\n", value, units[unit]',
+            '    else printf "%.1f %s\\n", value, units[unit]',
+            "  }'",
+            "}",
+            "",
+        ]
+    )
+    lines.extend(confirm_fn)
+    lines.extend(
+        [
+            "confirmed=0",
+            "skipped=0",
+            "deleted_bytes=0",
+            'REMOVED_LIST=$(mktemp)',
+            'trap \'rm -f "$REMOVED_LIST"\' EXIT',
+            f"{say} \"Disk space cleanup\"",
+            f"{say} \"Nothing is deleted unless you answer y or yes for that section.\"",
+            f"{say} \"Press Enter to skip a section.\"",
+            f"{say} \"\"",
+        ]
+    )
+    if not sections:
+        lines.append(f"{say} \"Nothing reclaimable was found.\"")
+        lines.append("exit 0")
+        return "\n".join(lines).rstrip() + "\n"
+
+    for section in sections:
+        lines.append(f"{say} \"----------------------------------------------------------------\"")
+        lines.append(f"{say} {shlex.quote('Section: ' + section.title)}")
+        lines.append(f"{say} {shlex.quote('Reclaimable: ' + fmt_bytes(section.size))}")
+        lines.append(f"{say} {shlex.quote(section.summary)}")
+        lines.append(f"{say} \"\"")
+        for report_line in section.lines:
+            if report_line == "":
+                lines.append(f"{say} \"\"")
+            else:
+                lines.append(f"{say} {shlex.quote(report_line)}")
+        lines.append(f"{say} \"\"")
+        lines.append("if confirm_section; then")
+        lines.append("  remove_failed=0")
+        for action in section.actions:
+            quoted_path = shlex.quote(str(action.path.resolve()))
+            lines.append(
+                f"  remove_counted {quoted_path} {shlex.quote(action.kind)} {action.size} || remove_failed=1"
+            )
+        lines.append("  confirmed=$((confirmed + 1))")
+        lines.append('  if [[ "$remove_failed" == "1" ]]; then')
+        lines.append(f"    {say} \"Confirmed, but some paths could not be removed.\"")
+        lines.append("  else")
+        lines.append(f"    {say} \"Removed this section.\"")
+        lines.append("  fi")
+        lines.append("else")
+        lines.append("  skipped=$((skipped + 1))")
+        lines.append(f"  {say} \"Skipped.\"")
+        lines.append("fi")
+        lines.append(f"{say} \"\"")
+
+    lines.extend(
+        [
+            f"{say} \"----------------------------------------------------------------\"",
+            f"{say} \"Finished.\"",
+            f'{say} "Confirmed sections: $confirmed"',
+            f'{say} "Skipped sections: $skipped"',
+            "formatted=$(format_bytes \"$deleted_bytes\")",
+            f'{say} "Size removed: $formatted"',
+            f"{say} \"A path that appears in two sections is counted once.\"",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render(report: Scan, home: Path, script_path: Path | None = None) -> str:
     repeat_groups = repeated_groups(report.models)
     variant_rows = variant_groups(report.models)
     safe_total = sum(item.size for item in report.safe_caches)
@@ -575,13 +1069,26 @@ def render(report: Scan, home: Path) -> str:
         "",
         "This report only lists files. It does not delete anything.",
         "",
-        (
-            f"Data volume: **{fmt_bytes(report.data_used)} used**, "
-            f"**{fmt_bytes(report.data_free)} free**, of {fmt_bytes(report.data_total)}."
-        ),
-        "",
-        "## Summary",
-        "",
+    ]
+    if script_path is not None:
+        lines.extend(
+            [
+                f"The delete script is `{script_path.name}`. It prints each section and its size, then deletes that section only if you answer `y`.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            (
+                f"Data volume: **{fmt_bytes(report.data_used)} used**, "
+                f"**{fmt_bytes(report.data_free)} free**, of {fmt_bytes(report.data_total)}."
+            ),
+            "",
+            "## Summary",
+            "",
+        ]
+    )
+    lines.append(
         md_table(
             ["Kind", "Size", "If you remove it"],
             [
@@ -596,11 +1103,9 @@ def render(report: Scan, home: Path) -> str:
                 ],
                 ["Personal files listed below", fmt_bytes(review_total), "Your files. The sizes are listed so you can decide."],
             ],
-        ),
-        "",
-        "## Safe caches",
-        "",
-    ]
+        )
+    )
+    lines.extend(["", "## Safe caches", ""])
     if report.safe_caches:
         lines.append(md_table(["Path", "Size", "Why it is safe"], path_rows(report.safe_caches, home)))
         lines.append("")
@@ -795,12 +1300,52 @@ def self_check() -> None:
             failures.append(f"base {exact}: got {got}, want {want}")
     if failures:
         raise SystemExit("self-check failed:\n" + "\n".join(failures))
+    sample_home = Path("/Users/example")
+    if is_deletable(sample_home, sample_home, "dir"):
+        raise SystemExit("self-check failed: home directory was treated as deletable")
+    if is_deletable(sample_home / "Library", sample_home, "dir"):
+        raise SystemExit("self-check failed: ~/Library was treated as deletable")
+    if is_deletable(sample_home / ".lmstudio" / "models", sample_home, "dir"):
+        raise SystemExit("self-check failed: the models folder was treated as deletable")
+    cache = sample_home / "Library" / "Caches" / "example"
+    if not is_deletable(cache, sample_home, "dir"):
+        raise SystemExit("self-check failed: a cache folder was refused")
+    blocked = section_if_any(
+        "Blocked",
+        "Must not be offered.",
+        ["home"],
+        [DeleteAction(sample_home, 1, "dir")],
+        sample_home,
+    )
+    if blocked is not None:
+        raise SystemExit("self-check failed: a blocked path became a section")
+    sample = DeleteSection(
+        "Safe caches",
+        "Apps rebuild these folders.",
+        ["      1.0 KB  ~/Library/Caches/example"],
+        [DeleteAction(cache, 1024, "dir")],
+    )
+    for shell_name, shebang, prompt in (
+        ("zsh", "#!/bin/zsh", 'print -n -r -- "Delete this section? [y/N] "'),
+        ("bash", "#!/bin/bash", 'printf \'%s\' "Delete this section? [y/N] "'),
+    ):
+        script = render_delete_script([sample], sample_home, shell_name, "test")
+        if not script.startswith(shebang + "\n"):
+            raise SystemExit(f"self-check failed: {shell_name} shebang")
+        if prompt not in script:
+            raise SystemExit(f"self-check failed: {shell_name} confirmation prompt")
+        if "rm -rf --" not in script or "confirm_section" not in script:
+            raise SystemExit(f"self-check failed: {shell_name} delete flow")
+        binary = "zsh" if shell_name == "zsh" else "bash"
+        check = subprocess.run([binary, "-n"], input=script, text=True, capture_output=True)
+        if check.returncode != 0:
+            raise SystemExit(f"self-check failed: {shell_name} syntax\n{check.stderr}")
     print("self-check ok")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan this Mac for disk space that can be freed and write a Markdown report."
+        description="Scan this Mac for disk space that can be freed and write a Markdown report and a delete script."
     )
     parser.add_argument(
         "-o",
@@ -808,6 +1353,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=Path("disk-space-to-free.md"),
         help="Markdown file to write. Default: ./disk-space-to-free.md",
+    )
+    parser.add_argument(
+        "--delete-script",
+        type=Path,
+        default=None,
+        help="Confirmation script to write. Default: ./delete-disk-space.zsh or .bash, matching this terminal.",
+    )
+    parser.add_argument(
+        "--shell",
+        choices=("zsh", "bash"),
+        default=None,
+        help="Shell language for the delete script. Default: zsh or bash from $SHELL.",
     )
     parser.add_argument(
         "--home",
@@ -818,9 +1375,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--self-check",
         action="store_true",
-        help="Check model-name grouping and exit.",
+        help="Check model-name grouping and the delete-script syntax, then exit.",
     )
     return parser.parse_args(argv)
+
+
+def place_output(path: Path) -> Path:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -836,12 +1401,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Home directory does not exist: {home}", file=sys.stderr)
         return 2
     report = scan(home)
-    text = render(report, home)
-    output = args.output.expanduser()
-    if not output.is_absolute():
-        output = Path.cwd() / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(text, encoding="utf-8")
+    shell = detect_shell(args.shell)
+    script_path = place_output(args.delete_script or Path(default_script_name(shell)))
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sections = build_delete_sections(report, home)
+    script_text = render_delete_script(sections, home, shell, generated_at)
+    script_path.write_text(script_text, encoding="utf-8")
+    script_path.chmod(0o755)
+    log(f"wrote {script_path}")
+    output = place_output(args.output)
+    output.write_text(render(report, home, script_path), encoding="utf-8")
     log(f"wrote {output}")
     return 0
 
