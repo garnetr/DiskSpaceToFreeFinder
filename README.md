@@ -39,6 +39,6 @@ Requires macOS and Python 3.9 or newer. The standard library is enough.
 
 ## License
 
-[MIT](LICENSE). Copyright (c) 2026 Garnet R. Chaney ([@IAmTheGarnet1](https://x.com/IAmTheGarnet1)).
+[MIT](LICENSE). Copyright (c) 2026 Garnet R. Chaney (https://x.com/IAmTheGarnet1).
 
-The copyright line is part of the license notice, so copies of the project keep the handle and the link.
+The copyright line is part of the license notice, so copies of the project keep that address.
