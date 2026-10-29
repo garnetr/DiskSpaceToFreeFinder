@@ -36,3 +36,9 @@ python3 disk_space_report.py --self-check
 The report and the delete script contain local file paths, so both are gitignored.
 
 Requires macOS and Python 3.9 or newer. The standard library is enough.
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 Garnet R. Chaney ([@IAmTheGarnet1](https://x.com/IAmTheGarnet1)).
+
+The copyright line is part of the license notice, so copies of the project keep the handle and the link.

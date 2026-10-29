@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Garnet R. Chaney (@IAmTheGarnet1, https://x.com/IAmTheGarnet1)
+# SPDX-License-Identifier: MIT
 """Scan this Mac for disk space that can be freed and write a Markdown report.
 
 The scanner itself does not delete files. It also writes a zsh or bash script
